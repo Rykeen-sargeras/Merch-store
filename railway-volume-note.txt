@@ -1,0 +1,7 @@
+Railway volume setup
+
+Create or open the Railway service, then Settings -> Volumes -> Add Volume.
+Set the mount path exactly to /data.
+Set the service variable DATABASE_PATH=/data/ledger.sqlite3.
+
+Without the mounted volume, Railway may replace the container filesystem during a redeploy and the SQLite ledger will not persist.
