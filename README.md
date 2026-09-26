@@ -8,6 +8,7 @@ A private Railway-hosted web app for syncing Printify products and orders, assig
 - Suggests an owner from the title prefix before the first dash. For example, Roxy - Mug suggests Roxy.
 - Select multiple products and assign an owner in one step. The assignment applies to future sales and the open period.
 - Tracks item retail, production cost, quantity, profit, the owner's 75% share, Rykeen's 25% share, a 25% reserve from Rykeen's share, and Rykeen's net.
+- The active ledger and payout export include only merch dated on or after the session start date. The initial session starts September 20, 2026; older sales remain archived and hidden from the active page.
 - Closing a period downloads an XLSX workbook with a product payout summary and sale details, archives the period, and starts a new period. Previous period sales are not included in the new period.
 - Protects the app with a password. The Printify token is stored in Railway Variables, not in the source or database.
 
