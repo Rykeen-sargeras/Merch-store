@@ -1,7 +1,8 @@
 import os
+import re
 import sqlite3
 import secrets
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from functools import wraps
 from pathlib import Path
@@ -38,7 +39,8 @@ def db_connect():
     """)
     if not db.execute("SELECT 1 FROM periods LIMIT 1").fetchone():
         db.execute("INSERT INTO periods(started) VALUES (?)", (datetime.now(timezone.utc).isoformat(),))
-    db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('next_cutoff_date','2026-09-20')")
+    db.execute("INSERT OR IGNORE INTO settings(key,value) SELECT 'next_session_start_date',value FROM settings WHERE key='next_cutoff_date'")
+    db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('next_session_start_date','2026-09-20')")
     db.commit()
     return db
 
@@ -121,10 +123,11 @@ def paged(path):
         page += 1
 
 def title_owner(title):
-    if "-" not in title:
-        return "Unassigned"
-    prefix = title.split("-", 1)[0].strip()
-    return prefix.title() if prefix else "Unassigned"
+    parts = re.split(r"\s*[-–—]\s*", title, maxsplit=1)
+    prefix = parts[0].strip()
+    # Only treat a single handle-like title prefix as an owner. Long product
+    # descriptions before a dash are not owner names.
+    return prefix.title() if len(parts) > 1 and re.fullmatch(r"[A-Za-z0-9_]+", prefix) else "Unassigned"
 
 def sync_shop_data(db):
     shops = printify_get("shops.json")
@@ -195,7 +198,20 @@ def dashboard():
     chosen = request.args.get("period", type=int) or active
     if not any(p["id"] == chosen for p in periods):
         chosen = active
-    rows = db.execute("SELECT * FROM items WHERE period_id=? ORDER BY ordered_at DESC,title", (chosen,)).fetchall()
+    default_start = db.execute("SELECT value FROM settings WHERE key='next_session_start_date'").fetchone()["value"]
+    session_start = request.args.get("session_start", default_start)
+    try:
+        start_day = date.fromisoformat(session_start)
+        if start_day.isoformat() != session_start:
+            raise ValueError()
+    except ValueError:
+        session_start = default_start
+        start_day = date.fromisoformat(session_start)
+    rows = db.execute("SELECT * FROM items WHERE period_id=?", (chosen,)).fetchall()
+    if chosen == active:
+        rows = [r for r in rows if order_local_date(r["ordered_at"]) is not None and order_local_date(r["ordered_at"]) >= start_day]
+    owner_order = lambda r: (r["owner"].lower() == "unassigned", r["owner"].casefold(), r["title"].casefold(), r["ordered_at"] or "")
+    rows.sort(key=owner_order)
     sums = {"retail":0,"production":0,"owner_share":0,"rykeen_tax":0,"rykeen_net":0}
     for r in rows:
         if r["retail"] is None or r["status"].lower() in ("canceled","cancelled","refunded"):
@@ -203,10 +219,9 @@ def dashboard():
         for key in sums:
             sums[key] += r[key] or 0
     products = db.execute("SELECT count(*) n FROM products").fetchone()["n"]
-    cutoff = db.execute("SELECT value FROM settings WHERE key='next_cutoff_date'").fetchone()["value"]
     db.close()
     return render_template("dashboard.html", rows=rows, periods=periods, chosen=chosen, active=active,
-                           sums=sums, products=products, cutoff=cutoff)
+                           sums=sums, products=products, session_start=session_start)
 
 @app.post("/sync")
 @login_required
@@ -250,11 +265,11 @@ def products():
     db.close()
     return render_template("products.html", products=result, query=query)
 
-def create_workbook(db, period_id, path, cutoff_date=None):
+def create_workbook(db, period_id, path, session_start_date=None):
     rows = db.execute("SELECT * FROM items WHERE period_id=? ORDER BY title,variant,ordered_at",(period_id,)).fetchall()
-    if cutoff_date:
-        cutoff = date.fromisoformat(cutoff_date)
-        rows = [r for r in rows if order_local_date(r["ordered_at"]) is None or order_local_date(r["ordered_at"]) <= cutoff]
+    if session_start_date:
+        start_day = date.fromisoformat(session_start_date)
+        rows = [r for r in rows if order_local_date(r["ordered_at"]) is not None and order_local_date(r["ordered_at"]) >= start_day]
     wb = Workbook()
     summary = wb.active
     summary.title = "Payout Summary"
@@ -297,17 +312,17 @@ def create_workbook(db, period_id, path, cutoff_date=None):
 def close_period():
     db = db_connect()
     period_id = current_period(db)
-    cutoff_date = request.form.get("cutoff_date","").strip()
+    session_start_date = request.form.get("session_start_date","").strip()
     try:
-        cutoff = date.fromisoformat(cutoff_date)
-        if cutoff.isoformat() != cutoff_date:
+        start_day = date.fromisoformat(session_start_date)
+        if start_day.isoformat() != session_start_date:
             raise ValueError()
     except ValueError:
         db.close()
-        flash("Choose a valid payout cutoff date.", "error")
+        flash("Choose a valid session start date.", "error")
         return redirect(url_for("dashboard"))
     open_rows = db.execute("SELECT * FROM items WHERE period_id=?",(period_id,)).fetchall()
-    included = [r for r in open_rows if order_local_date(r["ordered_at"]) is None or order_local_date(r["ordered_at"]) <= cutoff]
+    included = [r for r in open_rows if order_local_date(r["ordered_at"]) is not None and order_local_date(r["ordered_at"]) >= start_day]
     missing = sum(1 for r in included if r["owner"] == "Unassigned" or r["retail"] is None)
     if missing:
         db.close()
@@ -317,18 +332,12 @@ def close_period():
     temp=NamedTemporaryFile(prefix=f"Printify-Payout-{period_id}-",suffix=".xlsx",delete=False)
     temp.close()
     try:
-        create_workbook(db,period_id,temp.name,cutoff_date)
-        cutoff_end=datetime.combine(cutoff+timedelta(days=1),time.min,ZoneInfo("America/New_York"))
-        next_start=cutoff_end.astimezone(timezone.utc).isoformat()
-        db.execute("UPDATE periods SET closed=1,payday=? WHERE id=?",(cutoff_date,period_id))
-        db.execute("INSERT INTO periods(started) VALUES (?)",(next_start,))
-        new_period=current_period(db)
-        for r in open_rows:
-            sale_date=order_local_date(r["ordered_at"])
-            if sale_date is not None and sale_date > cutoff:
-                db.execute("UPDATE items SET period_id=? WHERE order_id=? AND line_no=?",(new_period,r["order_id"],r["line_no"]))
-        tomorrow=datetime.now(ZoneInfo("America/New_York")).date()
-        db.execute("UPDATE settings SET value=? WHERE key='next_cutoff_date'",(tomorrow.isoformat(),))
+        create_workbook(db,period_id,temp.name,session_start_date)
+        now=datetime.now(timezone.utc).isoformat()
+        db.execute("UPDATE periods SET closed=1,payday=? WHERE id=?",(now,period_id))
+        db.execute("INSERT INTO periods(started) VALUES (?)",(now,))
+        today=datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+        db.execute("UPDATE settings SET value=? WHERE key='next_session_start_date'",(today,))
         db.commit()
     except Exception:
         db.close()
