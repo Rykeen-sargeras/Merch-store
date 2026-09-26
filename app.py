@@ -1,10 +1,11 @@
 import os
 import sqlite3
 import secrets
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from functools import wraps
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 import requests
 from flask import Flask, Response, flash, redirect, render_template, request, send_file, session, url_for
@@ -33,9 +34,11 @@ def db_connect():
       rykeen_tax INTEGER, rykeen_net INTEGER, updated_at TEXT,
       PRIMARY KEY(order_id,line_no), FOREIGN KEY(period_id) REFERENCES periods(id));
     CREATE TABLE IF NOT EXISTS products(product_id TEXT PRIMARY KEY, title TEXT NOT NULL, owner TEXT NOT NULL DEFAULT 'Unassigned');
+    CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     """)
     if not db.execute("SELECT 1 FROM periods LIMIT 1").fetchone():
         db.execute("INSERT INTO periods(started) VALUES (?)", (datetime.now(timezone.utc).isoformat(),))
+    db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('next_cutoff_date','2026-09-20')")
     db.commit()
     return db
 
@@ -52,6 +55,19 @@ def payout(retail, production):
     rykeen = share(profit, 25)
     tax = share(rykeen, 25)
     return profit, profit - rykeen, rykeen, tax, rykeen - tax
+
+def order_local_date(value):
+    if not value:
+        return None
+    try:
+        if len(value) == 10:
+            return date.fromisoformat(value)
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(ZoneInfo("America/New_York")).date()
+    except (TypeError, ValueError):
+        return None
 
 def login_required(fn):
     @wraps(fn)
@@ -187,9 +203,10 @@ def dashboard():
         for key in sums:
             sums[key] += r[key] or 0
     products = db.execute("SELECT count(*) n FROM products").fetchone()["n"]
+    cutoff = db.execute("SELECT value FROM settings WHERE key='next_cutoff_date'").fetchone()["value"]
     db.close()
     return render_template("dashboard.html", rows=rows, periods=periods, chosen=chosen, active=active,
-                           sums=sums, products=products)
+                           sums=sums, products=products, cutoff=cutoff)
 
 @app.post("/sync")
 @login_required
@@ -233,8 +250,11 @@ def products():
     db.close()
     return render_template("products.html", products=result, query=query)
 
-def create_workbook(db, period_id, path):
+def create_workbook(db, period_id, path, cutoff_date=None):
     rows = db.execute("SELECT * FROM items WHERE period_id=? ORDER BY title,variant,ordered_at",(period_id,)).fetchall()
+    if cutoff_date:
+        cutoff = date.fromisoformat(cutoff_date)
+        rows = [r for r in rows if order_local_date(r["ordered_at"]) is None or order_local_date(r["ordered_at"]) <= cutoff]
     wb = Workbook()
     summary = wb.active
     summary.title = "Payout Summary"
@@ -277,7 +297,18 @@ def create_workbook(db, period_id, path):
 def close_period():
     db = db_connect()
     period_id = current_period(db)
-    missing = db.execute("SELECT count(*) n FROM items WHERE period_id=? AND (owner='Unassigned' OR retail IS NULL)",(period_id,)).fetchone()["n"]
+    cutoff_date = request.form.get("cutoff_date","").strip()
+    try:
+        cutoff = date.fromisoformat(cutoff_date)
+        if cutoff.isoformat() != cutoff_date:
+            raise ValueError()
+    except ValueError:
+        db.close()
+        flash("Choose a valid payout cutoff date.", "error")
+        return redirect(url_for("dashboard"))
+    open_rows = db.execute("SELECT * FROM items WHERE period_id=?",(period_id,)).fetchall()
+    included = [r for r in open_rows if order_local_date(r["ordered_at"]) is None or order_local_date(r["ordered_at"]) <= cutoff]
+    missing = sum(1 for r in included if r["owner"] == "Unassigned" or r["retail"] is None)
     if missing:
         db.close()
         flash(f"Assign owners and enter actual retail for {missing} line(s) before closing.", "error")
@@ -286,10 +317,18 @@ def close_period():
     temp=NamedTemporaryFile(prefix=f"Printify-Payout-{period_id}-",suffix=".xlsx",delete=False)
     temp.close()
     try:
-        create_workbook(db,period_id,temp.name)
-        now=datetime.now(timezone.utc).isoformat()
-        db.execute("UPDATE periods SET closed=1,payday=? WHERE id=?",(now,period_id))
-        db.execute("INSERT INTO periods(started) VALUES (?)",(now,))
+        create_workbook(db,period_id,temp.name,cutoff_date)
+        cutoff_end=datetime.combine(cutoff+timedelta(days=1),time.min,ZoneInfo("America/New_York"))
+        next_start=cutoff_end.astimezone(timezone.utc).isoformat()
+        db.execute("UPDATE periods SET closed=1,payday=? WHERE id=?",(cutoff_date,period_id))
+        db.execute("INSERT INTO periods(started) VALUES (?)",(next_start,))
+        new_period=current_period(db)
+        for r in open_rows:
+            sale_date=order_local_date(r["ordered_at"])
+            if sale_date is not None and sale_date > cutoff:
+                db.execute("UPDATE items SET period_id=? WHERE order_id=? AND line_no=?",(new_period,r["order_id"],r["line_no"]))
+        tomorrow=datetime.now(ZoneInfo("America/New_York")).date()
+        db.execute("UPDATE settings SET value=? WHERE key='next_cutoff_date'",(tomorrow.isoformat(),))
         db.commit()
     except Exception:
         db.close()
